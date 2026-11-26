@@ -10,30 +10,42 @@ import { rateLimit } from '@/lib/rate-limit'
 
 export type AuthState = { error?: string; message?: string } | undefined
 
-async function clientIp() {
-  const h = await headers()
-  return h.get('x-forwarded-for')?.split(',')[0]?.trim() ?? 'unknown'
-}
-
 const signInSchema = z.object({
   email: z.email().max(320),
   password: z.string().min(1).max(200),
   next: z.string().optional(),
 })
 
-export async function signIn(_: AuthState, formData: FormData): Promise<AuthState> {
+export async function signIn(
+  _: AuthState,
+  formData: FormData
+): Promise<AuthState> {
   const parsed = signInSchema.safeParse({
     email: formData.get('email'),
     password: formData.get('password'),
     next: formData.get('next') ?? undefined,
   })
-  if (!parsed.success) return { error: 'Enter a valid email address and password.' }
+
+  if (!parsed.success) {
+    return { error: 'Enter a valid email address and password.' }
+  }
 
   const ip = await clientIp()
-  const limit = rateLimit(`signin:${ip}:${parsed.data.email.toLowerCase()}`, 8, 5 * 60_000)
-  if (!limit.ok) return { error: 'Too many sign-in attempts. Please wait a few minutes and try again.' }
+
+  const limit = rateLimit(
+    `signin:${ip}:${parsed.data.email.toLowerCase()}`,
+    8,
+    5 * 60_000
+  )
+
+  if (!limit.ok) {
+    return {
+      error: 'Too many sign-in attempts. Please wait a few minutes and try again.'
+    }
+  }
 
   const supabase = await createClient()
+
   const { data, error } = await supabase.auth.signInWithPassword({
     email: parsed.data.email,
     password: parsed.data.password,
@@ -41,29 +53,54 @@ export async function signIn(_: AuthState, formData: FormData): Promise<AuthStat
 
   if (error) {
     console.error('[auth] sign-in failed', error.code, error.status)
+
     if (error.code === 'email_not_confirmed') {
-      return { error: 'Please confirm your email address using the link we sent before signing in.' }
+      return {
+        error: 'Please confirm your email address using the link we sent before signing in.'
+      }
     }
-    if (error.status === 429) return { error: 'Too many attempts. Please wait and try again.' }
+
+    if (error.status === 429) {
+      return { error: 'Too many attempts. Please wait and try again.' }
+    }
+
     if (error.code === 'invalid_credentials' || error.status === 400) {
       return { error: 'Invalid email or password.' }
     }
-    return { error: 'Sign-in is temporarily unavailable. Please try again.' }
+
+    return {
+      error: 'Sign-in is temporarily unavailable. Please try again.'
+    }
   }
 
   const admin = createAdminClient()
-  const { data: profile } = await admin
+
+  const { data: profile, error: profileError } = await admin
     .from('profiles')
     .select('organization_id, is_active')
     .eq('id', data.user.id)
     .maybeSingle()
 
-  if (!profile?.is_active) {
+  if (profileError) {
+    console.error('[auth] profile lookup failed', profileError.code)
     await supabase.auth.signOut()
-    return { error: 'Your account is disabled. Contact your administrator.' }
+    return {
+      error: 'Sign-in is temporarily unavailable. Please try again.'
+    }
   }
 
-  await admin.from('profiles').update({ last_login_at: new Date().toISOString() }).eq('id', data.user.id)
+  if (!profile || !profile.is_active) {
+    await supabase.auth.signOut()
+    return {
+      error: 'Your account is disabled. Contact your administrator.'
+    }
+  }
+
+  await admin
+    .from('profiles')
+    .update({ last_login_at: new Date().toISOString() })
+    .eq('id', data.user.id)
+
   await writeAudit({
     organizationId: profile.organization_id,
     userId: data.user.id,
@@ -74,9 +111,15 @@ export async function signIn(_: AuthState, formData: FormData): Promise<AuthStat
     details: { ip },
   })
 
-  const next = parsed.data.next && parsed.data.next.startsWith('/') && !parsed.data.next.startsWith('//') ? parsed.data.next : '/'
+  const next = parsed.data.next &&
+    parsed.data.next.startsWith('/') &&
+    !parsed.data.next.startsWith('//')
+      ? parsed.data.next
+      : '/'
+
   redirect(next)
 }
+
 
 const signUpSchema = z.object({
   fullName: z.string().trim().min(2, 'Enter your name').max(120),
